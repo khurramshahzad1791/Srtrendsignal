@@ -3,42 +3,56 @@ import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import plotly.graph_objects as go
 import time
+import pytz
 
-st.set_page_config(page_title="Crypto Signal Pro", layout="wide")
-st.title("📈 Crypto Signal Pro – 15m Entry with HTF Trend")
-st.markdown("Professional‑grade signals with entry zone, multiple TPs, stop loss, leverage recommendation, and position sizing.")
+# -------------------- Page Config --------------------
+st.set_page_config(page_title="Crypto Pro Scanner", layout="wide")
+st.title("📈 Crypto Pro Scanner – Multi‑Session, Multi‑TF, Volume‑Aware")
+st.markdown("""
+- **Top 100 pairs by volume** (updated hourly)
+- **Session‑aware** (Pakistan time: US, London, Asia)
+- **Multi‑timeframe trend** (1h/4h trend + 15m entry)
+- **Volume surge detection**
+- **A+ to C grade signals**
+""")
 
-# -------------------- Sidebar Settings --------------------
-with st.sidebar:
-    st.header("⚙️ Settings")
-    account_balance = st.number_input("Account Balance (USDT)", value=1000, step=100)
-    risk_percent = st.slider("Risk per trade (%)", 0.5, 5.0, 2.0) / 100
-    max_leverage = st.selectbox("Max Leverage", [50, 100, 200, 300, 500], index=1)
+# -------------------- Helper Functions --------------------
+def get_pakistan_time():
+    """Return current datetime in Pakistan (UTC+5)"""
+    return datetime.now(pytz.timezone('Asia/Karachi'))
 
-    st.markdown("---")
-    st.header("🕒 Timeframes")
-    tf_entry = st.selectbox("Entry Timeframe", ["15m"], index=0, disabled=True)  # fixed to 15m
-    tf_trend = st.selectbox("Trend Timeframe", ["1h", "4h"], index=0)
+def get_session(now_pk):
+    """Determine trading session based on hour in Pakistan time"""
+    hour = now_pk.hour
+    # Approximate sessions (UTC+5):
+    # Asia: 0–8 (overlaps with some US after-hours)
+    # London: 8–17
+    # US: 17–0 (next day)
+    if 0 <= hour < 8:
+        return "Asia"
+    elif 8 <= hour < 17:
+        return "London"
+    else:
+        return "US"
 
-    st.markdown("---")
-    st.header("📊 Pairs")
-    pairs = st.multiselect(
-        "Select Pairs",
-        ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"],
-        default=["BTC/USDT", "ETH/USDT"]
-    )
+def get_top_pairs(limit=100):
+    """Fetch top USDT pairs by 24h volume from Binance (public tickers)"""
+    exchange = ccxt.binance({'enableRateLimit': True})
+    tickers = exchange.fetch_tickers()
+    usdt_pairs = []
+    for symbol, ticker in tickers.items():
+        if symbol.endswith('/USDT') and ticker.get('quoteVolume'):
+            usdt_pairs.append((symbol, ticker['quoteVolume']))
+    usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+    return [p[0] for p in usdt_pairs[:limit]]
 
-    st.markdown("---")
-    if st.button("🔄 Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
+@st.cache_data(ttl=3600)  # cache for 1 hour
+def get_top_pairs_cached():
+    return get_top_pairs(100)
 
-# -------------------- Data Fetching --------------------
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)  # cache for 5 minutes
 def fetch_ohlcv(symbol, timeframe, limit=500):
-    """Fetch OHLCV data from Binance (public)"""
     try:
         exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -49,12 +63,12 @@ def fetch_ohlcv(symbol, timeframe, limit=500):
         st.warning(f"Error fetching {symbol}: {e}")
         return None
 
-# -------------------- Indicator Functions --------------------
 def add_indicators(df):
     """Add RSI, ATR, EMAs to dataframe"""
     close = df['close']
     high = df['high']
     low = df['low']
+    volume = df['volume']
 
     # RSI
     delta = close.diff()
@@ -73,6 +87,11 @@ def add_indicators(df):
     df['ema20'] = close.ewm(span=20).mean()
     df['ema50'] = close.ewm(span=50).mean()
     df['ema200'] = close.ewm(span=200).mean()
+
+    # Session volume average (for same session in past 7 days)
+    # For simplicity, we'll just compare current volume to 20-period average
+    df['vol_ma20'] = volume.rolling(20).mean()
+    df['vol_surge'] = volume / df['vol_ma20']
 
     return df
 
@@ -112,7 +131,6 @@ def find_trend_line(df, pivot_points, ascending=True):
     """Fit a line through pivot points (simplified)"""
     if len(pivot_points) < 2:
         return None
-    # Use last two pivots
     x1, y1 = pivot_points[-2]
     x2, y2 = pivot_points[-1]
     if (ascending and y2 > y1) or (not ascending and y2 < y1):
@@ -121,31 +139,25 @@ def find_trend_line(df, pivot_points, ascending=True):
         return slope, intercept
     return None
 
-# -------------------- Signal Generation --------------------
-def generate_signal(pair, df_entry, df_trend):
+def generate_signal(pair, df_entry, df_trend, session, top_rank):
     """Return a signal dict or None"""
     last_entry = df_entry.iloc[-1]
     last_trend = df_trend.iloc[-1]
 
-    # Higher timeframe trend (200 EMA)
+    # Higher timeframe trend
     htf_trend_up = last_trend['close'] > last_trend['ema200']
     htf_trend_down = last_trend['close'] < last_trend['ema200']
 
-    # Detect HTF support/resistance levels
+    # Detect HTF support/resistance
     htf_levels = find_support_resistance(df_trend, window=10, tolerance=0.005)
-    if not htf_levels:
-        htf_levels = []
-
-    # Find nearest support and resistance
     support = max([l for l in htf_levels if l < last_entry['close']], default=None)
     resistance = min([l for l in htf_levels if l > last_entry['close']], default=None)
 
-    # Detect HTF trend lines
+    # Trend lines
     pivots_high, pivots_low = detect_pivot_points(df_trend, window=5)
     uptrend_line = find_trend_line(df_trend, pivots_low, ascending=True)
     downtrend_line = find_trend_line(df_trend, pivots_high, ascending=False)
 
-    # Check proximity to trend lines (within 1%)
     near_uptrend = False
     near_downtrend = False
     if uptrend_line:
@@ -157,6 +169,10 @@ def generate_signal(pair, df_entry, df_trend):
         trend_price = slope * df_entry['timestamp'].iloc[-1].timestamp() + intercept
         near_downtrend = abs(last_entry['close'] - trend_price) / last_entry['close'] < 0.01
 
+    # Volume surge
+    vol_surge = last_entry['vol_surge'] if not pd.isna(last_entry['vol_surge']) else 1.0
+    vol_ok = vol_surge > 1.5
+
     # Candle patterns (simple)
     body = abs(last_entry['close'] - last_entry['open'])
     lower_shadow = last_entry['open'] - last_entry['low'] if last_entry['close'] > last_entry['open'] else last_entry['close'] - last_entry['low']
@@ -164,86 +180,101 @@ def generate_signal(pair, df_entry, df_trend):
     hammer = lower_shadow > body * 2 and upper_shadow < body * 0.3
     shooting_star = upper_shadow > body * 2 and lower_shadow < body * 0.3
 
-    # Entry conditions
-    long_signal = False
-    short_signal = False
-    reason = []
+    # Determine direction
+    long_candidates = []
+    short_candidates = []
 
-    # Long: HTF uptrend + price near support or uptrend line + bullish candle
+    # Long: HTF uptrend + price near support/uptrend line + (hammer or RSI <40 or volume surge)
     if htf_trend_up and (support or near_uptrend):
-        if hammer or last_entry['rsi'] < 40:
-            long_signal = True
-            if support:
-                reason.append(f"near HTF support {support:.2f}")
-            if near_uptrend:
-                reason.append("near HTF uptrend line")
-            if hammer:
-                reason.append("hammer candle")
-            if last_entry['rsi'] < 40:
-                reason.append(f"RSI {last_entry['rsi']:.1f} (oversold)")
+        score = 30
+        reasons = []
+        if support:
+            score += 15
+            reasons.append(f"near support {support:.2f}")
+        if near_uptrend:
+            score += 15
+            reasons.append("near uptrend line")
+        if hammer:
+            score += 15
+            reasons.append("hammer candle")
+        if last_entry['rsi'] < 40:
+            score += 10
+            reasons.append(f"RSI {last_entry['rsi']:.1f} (oversold)")
+        if vol_ok:
+            score += 10
+            reasons.append("volume surge")
+        long_candidates.append((score, reasons))
 
-    # Short: HTF downtrend + price near resistance or downtrend line + bearish candle
+    # Short: HTF downtrend + price near resistance/downtrend line + (shooting star or RSI >60 or volume surge)
     if htf_trend_down and (resistance or near_downtrend):
-        if shooting_star or last_entry['rsi'] > 60:
-            short_signal = True
-            if resistance:
-                reason.append(f"near HTF resistance {resistance:.2f}")
-            if near_downtrend:
-                reason.append("near HTF downtrend line")
-            if shooting_star:
-                reason.append("shooting star")
-            if last_entry['rsi'] > 60:
-                reason.append(f"RSI {last_entry['rsi']:.1f} (overbought)")
+        score = 30
+        reasons = []
+        if resistance:
+            score += 15
+            reasons.append(f"near resistance {resistance:.2f}")
+        if near_downtrend:
+            score += 15
+            reasons.append("near downtrend line")
+        if shooting_star:
+            score += 15
+            reasons.append("shooting star")
+        if last_entry['rsi'] > 60:
+            score += 10
+            reasons.append(f"RSI {last_entry['rsi']:.1f} (overbought)")
+        if vol_ok:
+            score += 10
+            reasons.append("volume surge")
+        short_candidates.append((score, reasons))
 
-    if not (long_signal or short_signal):
+    # Pick the best direction
+    direction = None
+    best_score = 0
+    best_reasons = []
+    if long_candidates:
+        best_long = max(long_candidates, key=lambda x: x[0])
+        best_score = best_long[0]
+        best_reasons = best_long[1]
+        direction = "LONG"
+    if short_candidates:
+        best_short = max(short_candidates, key=lambda x: x[0])
+        if best_short[0] > best_score:
+            best_score = best_short[0]
+            best_reasons = best_short[1]
+            direction = "SHORT"
+
+    if direction is None:
         return None
 
-    # Determine direction and compute levels
-    direction = "LONG" if long_signal else "SHORT"
+    # Compute entry zone, SL, TPs
     entry = last_entry['close']
     atr = last_entry['atr']
-
-    # Entry zone: entry ± 0.5*ATR
     entry_zone_low = entry - atr * 0.5
     entry_zone_high = entry + atr * 0.5
 
-    # Stop loss: for long, below support or recent low; for short, above resistance or recent high
     if direction == "LONG":
-        sl = min(support, last_entry['low'] * 0.99) if support else last_entry['low'] * 0.99
+        sl = support if support else last_entry['low'] * 0.99
+        tp1 = entry + atr * 2
+        tp2 = entry + atr * 3.5
+        tp3 = entry + atr * 5
     else:
-        sl = max(resistance, last_entry['high'] * 1.01) if resistance else last_entry['high'] * 1.01
+        sl = resistance if resistance else last_entry['high'] * 1.01
+        tp1 = entry - atr * 2
+        tp2 = entry - atr * 3.5
+        tp3 = entry - atr * 5
 
-    # Take profits (ATR multiples)
-    tp1 = entry + atr * 2 if direction == "LONG" else entry - atr * 2
-    tp2 = entry + atr * 3.5 if direction == "LONG" else entry - atr * 3.5
-    tp3 = entry + atr * 5 if direction == "LONG" else entry - atr * 5
-
-    # Confidence score / grade (0-100)
-    score = 50
-    if htf_trend_up or htf_trend_down:
-        score += 15
-    if support or resistance or near_uptrend or near_downtrend:
-        score += 15
-    if hammer or shooting_star:
-        score += 10
-    if last_entry['rsi'] < 40 or last_entry['rsi'] > 60:
-        score += 10
-    score = min(score, 100)
-
-    if score >= 90:
+    # Grade based on score
+    if best_score >= 80:
         grade = "A+"
-    elif score >= 80:
+    elif best_score >= 70:
         grade = "A"
-    elif score >= 70:
+    elif best_score >= 60:
         grade = "B+"
-    elif score >= 60:
+    elif best_score >= 50:
         grade = "B"
-    elif score >= 50:
-        grade = "C+"
     else:
         grade = "C"
 
-    # Leverage suggestion: based on ATR% (lower ATR% → higher leverage)
+    # Leverage suggestion based on ATR%
     atr_percent = atr / entry * 100
     if atr_percent < 0.3:
         leverage_rec = "100x – 200x"
@@ -252,70 +283,108 @@ def generate_signal(pair, df_entry, df_trend):
     else:
         leverage_rec = "20x – 50x"
 
-    # Position size
-    risk_amount = account_balance * risk_percent
-    stop_distance = abs(entry - sl)
-    position_size = risk_amount / stop_distance if stop_distance > 0 else 0
-    position_percent = position_size / account_balance * 100 if account_balance > 0 else 0
+    # Session boost
+    session_boost = {
+        "US": 1.2,
+        "London": 1.1,
+        "Asia": 0.9
+    }.get(session, 1.0)
+    # Not directly used, but could adjust confidence
 
-    # Reasoning paragraph
+    # Build reasoning paragraph
     reasoning = f"""
-**Market Context:** {'Uptrend' if htf_trend_up else 'Downtrend'} on higher timeframe.  
-**Key Levels:** {'Support near ' + f'{support:.2f}' if support else ''} {'Resistance near ' + f'{resistance:.2f}' if resistance else ''}.  
-**Entry Signal:** {', '.join(reason)}.  
-**Trade Plan:** Enter within {entry_zone_low:.2f}–{entry_zone_high:.2f} zone. Stop at {sl:.2f}. Target 1: {tp1:.2f}, Target 2: {tp2:.2f}, Target 3: {tp3:.2f}.  
-**Risk:** {risk_percent*100:.1f}% of account = ${risk_amount:.2f}. Position size ≈ {position_percent:.1f}% of account (${position_size:.2f}).  
-**Recommended Leverage:** {leverage_rec} (ATR = {atr_percent:.2f}%).
+**{pair} – {direction} (Grade: {grade})**  
+**Session:** {session} (Pakistan time)  
+**Trend:** {'Uptrend' if htf_trend_up else 'Downtrend'} on higher timeframe.  
+**Key Levels:** {'Support at ' + f'{support:.2f}' if support else ''} {'Resistance at ' + f'{resistance:.2f}' if resistance else ''}.  
+**Entry Signal:** {', '.join(best_reasons)}.  
+**Trade Plan:** Enter within {entry_zone_low:.2f}–{entry_zone_high:.2f}. Stop at {sl:.2f}. Targets: {tp1:.2f} (TP1), {tp2:.2f} (TP2), {tp3:.2f} (TP3).  
+**Volume:** {'Surge detected' if vol_ok else 'Normal'}.  
+**Recommended Leverage:** {leverage_rec} (ATR = {atr_percent:.2f}%).  
 """
 
     return {
         'pair': pair,
+        'rank': top_rank,
         'direction': direction,
-        'entry': entry,
+        'grade': grade,
+        'score': best_score,
         'entry_zone_low': entry_zone_low,
         'entry_zone_high': entry_zone_high,
         'sl': sl,
         'tp1': tp1,
         'tp2': tp2,
         'tp3': tp3,
-        'confidence': score,
-        'grade': grade,
         'leverage_rec': leverage_rec,
-        'position_size': position_size,
-        'position_percent': position_percent,
         'reasoning': reasoning,
+        'session': session,
         'timestamp': datetime.now()
     }
 
 # -------------------- Main UI --------------------
-signals = []
-progress_bar = st.progress(0)
-status_text = st.empty()
+st.sidebar.header("Settings")
 
-if st.button("🔍 Generate Signals Now"):
-    for i, pair in enumerate(pairs):
-        status_text.text(f"Analyzing {pair}...")
+# Pair source
+pair_limit = st.sidebar.slider("Number of top pairs to scan", 10, 100, 50, step=10)
+
+# Timeframes
+tf_entry = st.sidebar.selectbox("Entry Timeframe", ["15m"], index=0, disabled=True)
+tf_trend = st.sidebar.selectbox("Trend Timeframe", ["1h", "4h"], index=0)
+
+# Minimum grade to display
+min_grade = st.sidebar.selectbox("Minimum Grade to Show", ["All", "C", "B", "B+", "A", "A+"], index=0)
+
+# Manual refresh
+if st.sidebar.button("🔄 Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Display current Pakistan time and session
+now_pk = get_pakistan_time()
+session = get_session(now_pk)
+st.sidebar.info(f"🇵🇰 Pakistan Time: {now_pk.strftime('%H:%M')}\nSession: {session}")
+
+# Get top pairs
+top_pairs = get_top_pairs_cached()[:pair_limit]
+st.sidebar.write(f"Scanning top {len(top_pairs)} pairs by volume")
+
+# Scan button
+if st.button("🚀 Generate Signals"):
+    signals = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, pair in enumerate(top_pairs):
+        status_text.text(f"Analyzing {pair} ({i+1}/{len(top_pairs)})")
         df_entry = fetch_ohlcv(pair, tf_entry, 300)
         df_trend = fetch_ohlcv(pair, tf_trend, 200)
         if df_entry is not None and df_trend is not None:
             df_entry = add_indicators(df_entry)
             df_trend = add_indicators(df_trend)
-            signal = generate_signal(pair, df_entry, df_trend)
+            signal = generate_signal(pair, df_entry, df_trend, session, i+1)
             if signal:
                 signals.append(signal)
-        progress_bar.progress((i + 1) / len(pairs))
-        time.sleep(0.5)  # avoid rate limits
+        progress_bar.progress((i + 1) / len(top_pairs))
+        time.sleep(0.3)
 
     status_text.text("Analysis complete!")
     time.sleep(1)
     status_text.empty()
     progress_bar.empty()
 
-# Display signals
-if signals:
-    st.subheader("📡 Current Trading Signals")
-    for sig in signals:
-        with st.expander(f"{sig['pair']} – {sig['direction']} (Grade: {sig['grade']})", expanded=True):
+    # Filter by grade
+    grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
+    if min_grade != "All":
+        signals = [s for s in signals if grade_order.get(s['grade'], 0) >= grade_order[min_grade]]
+
+    # Store in session state
+    st.session_state.signals = signals
+
+# Display signals if present
+if 'signals' in st.session_state and st.session_state.signals:
+    st.subheader(f"📡 Trading Signals – {len(st.session_state.signals)} found")
+    for sig in st.session_state.signals:
+        with st.expander(f"Rank #{sig['rank']} – {sig['pair']} {sig['direction']} (Grade: {sig['grade']})", expanded=False):
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Entry Zone", f"{sig['entry_zone_low']:.2f} – {sig['entry_zone_high']:.2f}")
@@ -325,31 +394,33 @@ if signals:
                 st.metric("TP2", f"{sig['tp2']:.2f}")
                 st.metric("TP3", f"{sig['tp3']:.2f}")
             with col3:
-                st.metric("Confidence", f"{sig['confidence']}%")
+                st.metric("Score", f"{sig['score']}")
                 st.metric("Leverage Rec", sig['leverage_rec'])
-                st.metric("Position Size", f"{sig['position_percent']:.1f}% (${sig['position_size']:.2f})")
+                st.metric("Session", sig['session'])
             st.markdown(sig['reasoning'])
             st.caption(f"Generated: {sig['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Download CSV
     df_out = pd.DataFrame([{
+        'Rank': s['rank'],
         'Pair': s['pair'],
         'Direction': s['direction'],
+        'Grade': s['grade'],
         'Entry_Zone': f"{s['entry_zone_low']:.2f}-{s['entry_zone_high']:.2f}",
         'SL': s['sl'],
         'TP1': s['tp1'],
         'TP2': s['tp2'],
         'TP3': s['tp3'],
-        'Confidence': s['confidence'],
-        'Grade': s['grade'],
         'Leverage_Rec': s['leverage_rec'],
-        'Position_Size_USD': round(s['position_size'], 2),
+        'Session': s['session'],
         'Reasoning': s['reasoning']
-    } for s in signals])
+    } for s in st.session_state.signals])
     csv = df_out.to_csv(index=False)
     st.download_button("📥 Download Signals CSV", csv, "signals.csv", mime="text/csv")
-
 else:
-    st.info("👆 Click 'Generate Signals Now' to start analysis.")
+    if 'signals' in st.session_state:
+        st.info("No signals match the current criteria. Try adjusting the grade filter or scanning again.")
+    else:
+        st.info("👆 Click 'Generate Signals' to start analysis.")
 
-st.caption("Data source: Binance public API • Signals are for educational purposes only.")
+st.caption("Data source: Binance public API. Sessions based on Pakistan time (UTC+5). For educational purposes only.")
